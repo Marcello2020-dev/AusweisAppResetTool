@@ -19,6 +19,32 @@ struct ContentView: View {
     // ISO/IEC 7810 ID-1 (Ausweis/Kreditkarte) aspect ratio
     private let cardAspect: CGFloat = 85.60 / 53.98
 
+    @State private var bottomButtonWidths: [Int: CGFloat] = [:]
+    @State private var bottomButtonRowHeight: CGFloat = 0
+    private let bottomButtonSpacing: CGFloat = 10
+    private let stripeHeight: CGFloat = 16
+
+    private struct ButtonWidthPreferenceKey: PreferenceKey {
+        static var defaultValue: [Int: CGFloat] = [:]
+        static func reduce(value: inout [Int: CGFloat], nextValue: () -> [Int: CGFloat]) {
+            value.merge(nextValue(), uniquingKeysWith: { $1 })
+        }
+    }
+
+    private struct BottomButtonRowHeightPreferenceKey: PreferenceKey {
+        static var defaultValue: CGFloat = 0
+        static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+            value = max(value, nextValue())
+        }
+    }
+
+    private func readWidth(index: Int) -> some View {
+        GeometryReader { proxy in
+            Color.clear
+                .preference(key: ButtonWidthPreferenceKey.self, value: [index: proxy.size.width])
+        }
+    }
+
     private var brandNSImage: NSImage {
         // Optional: if you later add an asset named "BrandIcon" it will be used automatically.
         NSImage(named: "BrandIcon") ?? NSApplication.shared.applicationIconImage
@@ -54,22 +80,7 @@ struct ContentView: View {
                     .offset(x: 210, y: 60)
                     .allowsHitTesting(false)
 
-                // Bottom tricolor stripe (Schwarz–Rot–Gold)
-                VStack(spacing: 0) {
-                    Spacer()
-                    HStack(spacing: 0) {
-                        Rectangle().fill(Color.black.opacity(0.90))
-                        Rectangle().fill(Color.red.opacity(0.85))
-                        Rectangle().fill(Color(red: 0.83, green: 0.69, blue: 0.22)) // #D4AF37
-                    }
-                    .frame(height: 18)
-                    .clipShape(
-                        RoundedRectangle(cornerRadius: 18, style: .continuous)
-                    )
-                    .padding(.horizontal, 18)
-                    .padding(.bottom, 18)
-                }
-                .allowsHitTesting(false)
+
 
                 // Foreground content
                 VStack(alignment: .leading, spacing: 14) {
@@ -95,15 +106,22 @@ struct ContentView: View {
                             Task { await svc.bigResetAndReinstall() }
                         }
                         .buttonStyle(.borderedProminent)
-                        .tint(Color(red: 0.83, green: 0.69, blue: 0.22)) // #D4AF37
+                        .tint(Color.black.opacity(0.85))
                         .controlSize(.large)
                         .keyboardShortcut(.defaultAction)
+
+                        Button("App hart neu starten") {
+                            Task { await svc.hardRestartOnly() }
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .tint(Color.red.opacity(0.85))
+                        .controlSize(.large)
 
                         Button("Kleiner Reset") {
                             Task { await svc.smallReset() }
                         }
                         .buttonStyle(.borderedProminent)
-                        .tint(Color.black.opacity(0.85))
+                        .tint(Color(red: 0.83, green: 0.69, blue: 0.22)) // #D4AF37
                         .controlSize(.large)
                     }
 
@@ -128,26 +146,32 @@ struct ContentView: View {
                             .font(.footnote)
                             .foregroundStyle(.secondary)
 
-                        HStack(spacing: 10) {
+                        HStack(spacing: bottomButtonSpacing) {
                             Button("Datenschutz & Sicherheit öffnen") {
                                 svc.openPrivacySettingsRoot()
                             }
                             .buttonStyle(.borderedProminent)
                             .tint(Color.black.opacity(0.85))
+                            .background(readWidth(index: 0))
 
                             Button("Vollzugriff auf Festplatte") {
                                 svc.openFullDiskAccessSettings()
                             }
                             .buttonStyle(.borderedProminent)
-                            .tint(Color(red: 0.83, green: 0.69, blue: 0.22)) // #D4AF37
+                            .tint(Color.red.opacity(0.85))
+                            .background(readWidth(index: 1))
 
                             Button("App-Management") {
                                 svc.openAppManagementSettings()
                             }
                             .buttonStyle(.borderedProminent)
-                            .tint(Color.red.opacity(0.85))
+                            .tint(Color(red: 0.83, green: 0.69, blue: 0.22)) // #D4AF37
+                            .background(readWidth(index: 2))
                         }
                         .controlSize(.regular)
+                        .buttonBorderShape(.capsule)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .onPreferenceChange(ButtonWidthPreferenceKey.self) { bottomButtonWidths = $0 }
                     }
                 }
                 .padding(18)
@@ -188,6 +212,22 @@ final class AusweisAppResetService: ObservableObject {
     }
 
     // MARK: Public API
+
+    func hardRestartOnly() async {
+        append("== App hart neu starten ==")
+        guard let appURL = findAusweisAppURL() else {
+            append("FEHLER: AusweisApp nicht gefunden.")
+            append("Hinweis: Bitte aus /Applications oder ~/Applications starten und erneut versuchen.")
+            return
+        }
+        append("App gefunden: \(appURL.path)")
+        let bundleId = readBundleId(appURL: appURL) ?? fallbackBundleId
+        append("Bundle-ID: \(bundleId)")
+        await quitAppBestEffort(bundleId: bundleId, appURL: appURL)
+        append("Starte App neu…")
+        openApp(at: appURL)
+        append("Fertig.")
+    }
 
     func smallReset() async {
         append("== Kleiner Reset ==")
