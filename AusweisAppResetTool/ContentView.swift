@@ -299,25 +299,12 @@ final class AusweisAppResetService: ObservableObject {
             return
         }
 
-        if !del.needsAdmin.isEmpty {
-            let ok = runAdminDeleteBatch(del.needsAdmin)
-            if !ok {
-                append("ABBRUCH: Einige Pfade konnten trotz Admin nicht gelöscht werden (macOS Datenschutz/TCC).")
-                append("Aktiviere je nach Hinweis im Log: Vollzugriff auf Festplatte und starte dann erneut.")
-                append("Wichtig: Bei Ausführung aus Xcode gelten Rechte für den Debug-Runner; für stabile Rechte die exportierte/standalone App autorisieren.")
-                append("Fertig.")
-                return
-            }
-        }
-
-        // 2) App entfernen
-        if appURL.path.hasPrefix("/Applications/") {
-            append("Entferne App aus /Applications (benötigt ggf. App-Management)…")
-            let ok = await recycleApplicationBundle(appURL)
-            guard ok else {
-                append("Fertig.")
-                return
-            }
+        // 2) App-Pfad klassifizieren (für gebündelte Admin-Schritte).
+        var adminBatchPaths = del.needsAdmin
+        let appIsInApplications = appURL.path.hasPrefix("/Applications/")
+        if appIsInApplications {
+            append("Entferne App aus /Applications (gebündelt im Admin-Batch)…")
+            adminBatchPaths.append(appURL.path)
         } else {
             append("Entferne App (kein /Applications-Pfad; ohne Admin)…")
             do {
@@ -334,7 +321,7 @@ final class AusweisAppResetService: ObservableObject {
             return
         }
 
-        // 4) mas sicherstellen (Terminalausgabe in GUI)
+        // 4) mas sicherstellen
         let masOk = await ensureMasInstalled(brewPath: brew)
         guard masOk else {
             append("Abbruch: mas steht nicht zur Verfügung. Öffne App Store Seite als Fallback.")
@@ -342,34 +329,68 @@ final class AusweisAppResetService: ObservableObject {
             return
         }
 
-        // 5) Neuinstallation via mas
+        guard let masBin = masPath() else {
+            append("FEHLER: mas-Binary nicht gefunden, obwohl Installation als erfolgreich gemeldet wurde.")
+            openURL("https://apps.apple.com/de/app/ausweisapp-bund/id\(appStoreId)")
+            return
+        }
+
+        let masNeedsRoot = masInstallRequiresRoot(masPath: masBin)
+        if masNeedsRoot {
+            append("Hinweis: Die installierte mas-Version verlangt Root-Rechte für 'mas install'.")
+        }
+
+        // 5) Privilegierte Schritte und Installation ausführen.
         append("Installiere AusweisApp Bund via mas install \(appStoreId)…")
         append("Hinweis: Du musst im Mac App Store angemeldet sein.")
 
-        // WICHTIG: mas als root via AppleScript führt zu „Failed to get sudo uid“.
-        // Daher: mas als Nutzer im Terminal (TTY vorhanden), Log in GUI streamen.
-        let masLogURL = URL(fileURLWithPath: "/tmp/ausweisapp-mas-install.log")
-        try? "".write(to: masLogURL, atomically: true, encoding: .utf8)
-        startTailing(masLogURL)
+        if !adminBatchPaths.isEmpty {
+            append("Führe privilegierte Löschschritte gebündelt aus (max. eine Touch ID/Passwort-Abfrage)…")
+            let ok = runAdminDeleteBatch(adminBatchPaths)
+            if !ok {
+                append("ABBRUCH: Einige Pfade konnten trotz Admin nicht gelöscht werden (macOS Datenschutz/TCC).")
+                append("Aktiviere je nach Hinweis im Log: Vollzugriff auf Festplatte und/oder App-Management und starte dann erneut.")
+                append("Wichtig: Bei Ausführung aus Xcode gelten Rechte für den Debug-Runner; für stabile Rechte die exportierte/standalone App autorisieren.")
+                append("Fertig.")
+                return
+            }
+        }
 
-        let termMasCmd = "/bin/zsh -lc \"mas install \(appStoreId) 2>&1 | tee -a \(masLogURL.path)\""
-        openTerminalAndRun(termMasCmd, autoCloseWhenDone: true)
+        if masNeedsRoot {
+            append("Hinweis: mas mit Root-Anforderung wird im Terminal (TTY) ausgeführt, um Auth-/sudo-Loops ohne TTY zu vermeiden.")
+            append("== mas Output (Terminal/TTY) ==")
+            let ok = await runMasInstallInTerminalWithTTY(masPath: masBin, appId: appStoreId)
+            append("== mas Ende (Terminal/TTY) ==")
+            if !ok {
+                append("FEHLER: mas install (Terminal/TTY) fehlgeschlagen oder Timeout.")
+                append("Prüfe Terminal-Fenster (Passwort/Store-Login/Netzwerk) und versuche es erneut.")
+                openURL("https://apps.apple.com/de/app/ausweisapp-bund/id\(appStoreId)")
+                return
+            }
+        } else {
+            append("== mas Output (mas install \(appStoreId)) ==")
+            let masStatus = await runProcessStreaming(masBin, ["install", appStoreId])
+            append("== mas Ende (exit \(masStatus)) ==")
+            guard masStatus == 0 else {
+                append("FEHLER: mas install fehlgeschlagen.")
+                append("Prüfe Mac-App-Store-Login und Netzwerk; falls nötig, App Store öffnen und Anmeldung prüfen.")
+                openURL("https://apps.apple.com/de/app/ausweisapp-bund/id\(appStoreId)")
+                return
+            }
+        }
 
-        // Poll: warte bis App wieder auftaucht (max ~5 Minuten)
+        // 6) Kurzer Poll für Spotlight/Filesystem-Sichtbarkeit.
         var installedURL: URL? = nil
-        for _ in 0..<150 {
+        for _ in 0..<15 {
             if let u = findAusweisAppURL() {
                 installedURL = u
                 break
             }
-            try? await Task.sleep(nanoseconds: 2_000_000_000) // 2s
+            try? await Task.sleep(nanoseconds: 1_000_000_000) // 1s
         }
 
-        stopTailing()
-
         guard let newURL = installedURL else {
-            append("FEHLER: App wurde nach mas install nicht gefunden (Timeout).")
-            append("Prüfe Terminal: ggf. sudo-Prompt, Store-Login, Netzwerk.")
+            append("FEHLER: App wurde nach erfolgreichem mas-Run nicht gefunden.")
             append("Fallback: App Store Seite öffnen.")
             openURL("https://apps.apple.com/de/app/ausweisapp-bund/id\(appStoreId)")
             return
@@ -654,10 +675,77 @@ final class AusweisAppResetService: ObservableObject {
         return out.isEmpty ? nil : out
     }
 
-    private func masExists() -> Bool {
-        let out = runProcessCapture("/bin/zsh", ["-lc", "command -v mas >/dev/null 2>&1; echo $?"])
+    private func masPath() -> String? {
+        let candidates = ["/opt/homebrew/bin/mas", "/usr/local/bin/mas"]
+        for c in candidates where FileManager.default.isExecutableFile(atPath: c) { return c }
+
+        // Fallback ohne Login-Shell, um Alias/Funktions-Treffer zu vermeiden.
+        let out = runProcessCapture("/usr/bin/which", ["mas"])
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        return out == "0"
+        guard !out.isEmpty else { return nil }
+
+        // `which` kann mehrere Zeilen liefern; nimm den ersten gültigen Pfad.
+        let first = out.split(separator: "\n").map(String.init).first ?? ""
+        return FileManager.default.isExecutableFile(atPath: first) ? first : nil
+    }
+
+    private func masExists() -> Bool {
+        masPath() != nil
+    }
+
+    private func masInstallRequiresRoot(masPath: String) -> Bool {
+        let help = runProcessCapture(masPath, ["install", "--help"]).lowercased()
+        return help.contains("requires root privileges")
+    }
+
+    private func appendOutputLines(_ output: String) {
+        let lines = output.split(whereSeparator: \.isNewline).map(String.init)
+        for line in lines where !line.isEmpty {
+            append(line)
+        }
+    }
+
+    private func runMasInstallAsAdmin(masPath: String, appId: String) -> Bool {
+        let user = NSUserName()
+        let home = NSHomeDirectory()
+        let uid = getuid()
+        let gid = getgid()
+        let script =
+            "export SUDO_UID=\(uid); " +
+            "export SUDO_GID=\(gid); " +
+            "export SUDO_USER=\(shellQuote(user)); " +
+            "export USER=\(shellQuote(user)); " +
+            "export LOGNAME=\(shellQuote(user)); " +
+            "export HOME=\(shellQuote(home)); " +
+            "\(shellQuote(masPath)) install \(appId)"
+        let cmd = "/bin/zsh -lc \(shellQuote(script))"
+        let res = runAsAdminShellWithOutput(cmd, timeoutSeconds: 1200)
+        let trimmed = res.output.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmed.isEmpty { appendOutputLines(trimmed) }
+        return res.ok
+    }
+
+    /// Führt `mas install` im Terminal mit TTY aus (wichtig für mas-Versionen mit sudo/TTY-Pflicht).
+    /// Wartet bis die App wieder gefunden wird oder ein Timeout erreicht ist.
+    private func runMasInstallInTerminalWithTTY(masPath: String, appId: String) async -> Bool {
+        let masLogURL = URL(fileURLWithPath: "/tmp/ausweisapp-mas-install.log")
+        try? "".write(to: masLogURL, atomically: true, encoding: .utf8)
+        startTailing(masLogURL)
+
+        let termScript = "sudo -k \(shellQuote(masPath)) install \(appId) 2>&1 | /usr/bin/tee -a \(shellQuote(masLogURL.path))"
+        let termCmd = "/bin/zsh -lc \(shellQuote(termScript))"
+        openTerminalAndRun(termCmd, autoCloseWhenDone: true)
+
+        defer { stopTailing() }
+
+        // Maximal ~8 Minuten warten (240 * 2s)
+        for _ in 0..<240 {
+            if findAusweisAppURL() != nil {
+                return true
+            }
+            try? await Task.sleep(nanoseconds: 2_000_000_000)
+        }
+        return false
     }
 
     private func ensureHomebrewInstalled() async -> String? {
@@ -751,52 +839,37 @@ final class AusweisAppResetService: ObservableObject {
     }
 
     private func openTerminalAndRun(_ cmd: String, autoCloseWhenDone: Bool = false) {
-        // 1) Open a Terminal tab and run the command; return the tab id immediately.
-        let scriptOpen = """
+        if autoCloseWhenDone {
+            // Keep open/close in one AppleScript process to avoid fragile tab-id roundtrips.
+            let script = """
+            tell application \"Terminal\"
+              activate
+              if (count of windows) is 0 then
+                do script \"\"
+              end if
+              set targetTab to do script \"\(escapeForAppleScript(cmd))\" in front window
+              repeat while (busy of targetTab)
+                delay 0.5
+              end repeat
+              try
+                close targetTab
+              end try
+            end tell
+            """
+            runProcessFireAndForget("/usr/bin/osascript", ["-e", script])
+            return
+        }
+
+        let script = """
         tell application \"Terminal\"
           activate
           if (count of windows) is 0 then
             do script \"\"
           end if
-          set theTab to do script \"\(escapeForAppleScript(cmd))\" in front window
-          return id of theTab
+          do script \"\(escapeForAppleScript(cmd))\" in front window
         end tell
         """
-
-        let out = runProcessCapture("/usr/bin/osascript", ["-e", scriptOpen])
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-
-        guard autoCloseWhenDone else { return }
-
-        // 2) Fire-and-forget watcher that closes the specific tab once it is no longer busy.
-        guard let tabId = Int(out), tabId > 0 else { return }
-
-        let scriptClose = """
-        tell application \"Terminal\"
-          set targetTab to missing value
-          repeat with w in windows
-            repeat with t in tabs of w
-              if (id of t) is \(tabId) then
-                set targetTab to t
-                exit repeat
-              end if
-            end repeat
-            if targetTab is not missing value then exit repeat
-          end repeat
-
-          if targetTab is missing value then return
-
-          repeat while (busy of targetTab)
-            delay 0.5
-          end repeat
-
-          try
-            close targetTab
-          end try
-        end tell
-        """
-
-        runProcessFireAndForget("/usr/bin/osascript", ["-e", scriptClose])
+        _ = runProcessCapture("/usr/bin/osascript", ["-e", script])
     }
 
     // MARK: - Process Helpers
@@ -889,7 +962,7 @@ final class AusweisAppResetService: ObservableObject {
 
     /// Führt ein Shell-Kommando via osascript mit Administratorrechten aus und gibt Erfolg + Output zurück.
     /// Hinweis: "do shell script" liefert bei Exit != 0 typischerweise einen AppleScript-"execution error".
-    private func runAsAdminShellWithOutput(_ command: String) -> (ok: Bool, output: String) {
+    private func runAsAdminShellWithOutput(_ command: String, timeoutSeconds: Int = 900) -> (ok: Bool, output: String) {
         // Bring this app to the foreground so the auth dialog is not hidden behind other windows.
         NSApp.activate(ignoringOtherApps: true)
         adminPromptCount += 1
@@ -897,7 +970,11 @@ final class AusweisAppResetService: ObservableObject {
 
         // macOS may offer Touch ID here (if configured for admin auth), otherwise password.
         let prompt = "Administratorrechte erforderlich (AusweisApp Reset Tool)"
-        let script = "do shell script \"\(escapeForAppleScript(command))\" with administrator privileges with prompt \"\(escapeForAppleScript(prompt))\""
+        let safeTimeout = max(30, timeoutSeconds)
+        let script =
+            "with timeout of \(safeTimeout) seconds\n" +
+            "do shell script \"\(escapeForAppleScript(command))\" with administrator privileges with prompt \"\(escapeForAppleScript(prompt))\"\n" +
+            "end timeout"
         let out = runProcessCapture("/usr/bin/osascript", ["-e", script])
         let trimmed = out.trimmingCharacters(in: .whitespacesAndNewlines)
 
@@ -937,7 +1014,9 @@ final class AusweisAppResetService: ObservableObject {
             "/bin/rm -rf \"$p\"; " +
             "done"
 
-        let adminCmd = "/bin/zsh -lc \"\(adminScript)\""
+        // Wichtig: Script als EIN Argument quoten, damit "$p" erst in zsh expandiert
+        // und nicht schon im äußeren Shell-Kontext leer wird.
+        let adminCmd = "/bin/zsh -lc \(shellQuote(adminScript))"
         let res = runAsAdminShellWithOutput(adminCmd)
 
         if !res.ok {
@@ -986,139 +1065,6 @@ final class AusweisAppResetService: ObservableObject {
         return false
     }
 
-    // MARK: - /Applications Removal (App-Management-aware)
-
-    /// Attempts to move an app bundle in /Applications to Trash.
-    /// Preference order:
-    /// 1) `FileManager.trashItem` (may trigger the standard macOS authorization prompt)
-    /// 2) `NSWorkspace.recycle` as a fallback
-    ///
-    /// If both fail with permission errors, the most likely root cause is missing macOS
-    /// Privacy permission: Datenschutz & Sicherheit → App-Management.
-    private func recycleApplicationBundle(_ appURL: URL) async -> Bool {
-        append("Verschiebe App in Papierkorb…")
-
-        func isPermissionLike(_ message: String) -> Bool {
-            let msg = message.lowercased()
-            return msg.contains("permission") ||
-                   msg.contains("not permitted") ||
-                   msg.contains("operation not permitted") ||
-                   msg.contains("keine berecht") ||
-                   msg.contains("nicht berechtigt")
-        }
-
-        // 1) First try FileManager.trashItem (often behaves closer to Finder semantics)
-        do {
-            _ = try FileManager.default.trashItem(at: appURL, resultingItemURL: nil)
-
-            if !FileManager.default.fileExists(atPath: appURL.path) {
-                append("App nach Papierkorb verschoben: \(appURL.path)")
-                return true
-            }
-        } catch {
-            let msg = error.localizedDescription
-            append("FEHLER: Entfernen aus /Applications fehlgeschlagen: \(msg)")
-
-            // Wenn es nach fehlenden Rechten aussieht: NICHT noch einmal über NSWorkspace probieren (das führt
-            // fast immer zu doppelten Fehlermeldungen), sondern direkt einen Admin-Fallback anbieten.
-            if isPermissionLike(msg) {
-                append("Ursache sehr wahrscheinlich: macOS Datenschutz (App-Management) und/oder fehlende Admin-Rechte für /Applications.")
-                append("Erforderlich: Systemeinstellungen → Datenschutz & Sicherheit → App-Management → dieses Tool aktivieren.")
-                if ProcessInfo.processInfo.environment["XCODE_VERSION_ACTUAL"] != nil {
-                    append("Hinweis: Du startest vermutlich aus Xcode. Dann in App-Management ggf. auch Xcode aktivieren, sonst wird die Aktion weiterhin blockiert.")
-                }
-                openAppManagementSettings()
-
-                append("Versuche Entfernen als Admin (ein Prompt)…")
-
-                // Prefer moving to the user’s Trash (so it behaves like Finder). If that fails, fall back to rm -rf.
-                if adminMoveAppToUserTrash(appURL) {
-                    return true
-                }
-
-                append("Admin-Entfernen via Papierkorb fehlgeschlagen; versuche rm -rf (Admin)…")
-                return runAdminDeleteBatch([appURL.path])
-            }
-
-            // For non-permission errors, continue with NSWorkspace fallback below.
-        }
-
-        // 2) Fallback: NSWorkspace.recycle
-        return await withCheckedContinuation { continuation in
-            NSWorkspace.shared.recycle([appURL]) { [weak self] _, error in
-                Task { @MainActor [weak self] in
-                    guard let self else {
-                        continuation.resume(returning: false)
-                        return
-                    }
-
-                    if let error {
-                        let msg = error.localizedDescription
-                        self.append("FEHLER: Entfernen aus /Applications fehlgeschlagen: \(msg)")
-
-                        if isPermissionLike(msg) {
-                            self.append("Erforderlich: Systemeinstellungen → Datenschutz & Sicherheit → App-Management → dieses Tool aktivieren.")
-                            if ProcessInfo.processInfo.environment["XCODE_VERSION_ACTUAL"] != nil {
-                                self.append("Hinweis: Du startest vermutlich aus Xcode. Dann in App-Management ggf. auch Xcode aktivieren.")
-                            }
-                            self.openAppManagementSettings()
-
-                            self.append("Versuche Entfernen als Admin (ein Prompt)…")
-                            if self.adminMoveAppToUserTrash(appURL) {
-                                continuation.resume(returning: true)
-                                return
-                            }
-                            let ok = self.runAdminDeleteBatch([appURL.path])
-                            continuation.resume(returning: ok)
-                            return
-                        }
-
-                        continuation.resume(returning: false)
-                        return
-                    }
-
-                    // Best-effort: verify the bundle path is gone
-                    if FileManager.default.fileExists(atPath: appURL.path) {
-                        self.append("WARNUNG: App existiert weiterhin unter \(appURL.path).")
-                        self.append("Erforderlich: Systemeinstellungen → Datenschutz & Sicherheit → App-Management → dieses Tool aktivieren.")
-                        if ProcessInfo.processInfo.environment["XCODE_VERSION_ACTUAL"] != nil {
-                            self.append("Hinweis: Du startest vermutlich aus Xcode. Dann in App-Management ggf. auch Xcode aktivieren.")
-                        }
-                        self.openAppManagementSettings()
-                        continuation.resume(returning: false)
-                        return
-                    }
-
-                    self.append("App nach Papierkorb verschoben: \(appURL.path)")
-                    continuation.resume(returning: true)
-                }
-            }
-        }
-    }
-
-    /// Admin-Fallback: versucht, das App-Bundle in den Papierkorb des aktuellen Users zu verschieben.
-    /// (Wenn App-Management fehlt, schlägt auch das als Admin häufig fehl.)
-    private func adminMoveAppToUserTrash(_ appURL: URL) -> Bool {
-        let fm = FileManager.default
-        guard fm.fileExists(atPath: appURL.path) else { return true }
-
-        let user = NSUserName()
-        let trash = "/Users/\(user)/.Trash"
-        let ts = Int(Date().timeIntervalSince1970)
-        let dest = "\(trash)/\(appURL.lastPathComponent).\(ts)"
-
-        let cmd = "/bin/zsh -lc \"/bin/mkdir -p \(shellQuote(trash)); /bin/mv -f \(shellQuote(appURL.path)) \(shellQuote(dest))\""
-        let res = runAsAdminShellWithOutput(cmd)
-
-        if res.ok, !fm.fileExists(atPath: appURL.path) {
-            append("App nach Papierkorb verschoben (Admin): \(dest)")
-            return true
-        }
-
-        // If the move failed, keep a concise log entry (the detailed AppleScript error is already logged by caller paths).
-        return false
-    }
-
     // MARK: - Logging
 
     private func append(_ line: String) {
@@ -1126,4 +1072,3 @@ final class AusweisAppResetService: ObservableObject {
         logText += "[\(ts)] \(line)\n"
     }
 }
-
